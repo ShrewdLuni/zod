@@ -16,10 +16,10 @@ interface JSONSchemaGeneratorParams {
   unrepresentable?: "throw" | "any";
   /** Arbitrary custom logic that can be used to modify the generated JSON Schema. */
   override?: (ctx: { zodSchema: schemas.$ZodType; jsonSchema: JSONSchema.BaseSchema }) => void;
-  /** How to handle pipes. Pipes contain an input and output schema.
+  /** Whether to extract the `"input"` or `"output"` type. Relevant to transforms, Error converting schema to JSONz, defaults, coerced primitives, etc.
    * - `"output" — Default. Convert the output schema.
    * - `"input"` — Convert the input schema. */
-  pipes?: "input" | "output";
+  io?: "input" | "output";
 }
 
 interface ProcessParams {
@@ -68,12 +68,13 @@ interface Seen {
   defId?: string | undefined;
   // external?: string | undefined;
 }
+
 export class JSONSchemaGenerator {
   metadataRegistry: $ZodRegistry<Record<string, any>>;
   target: "draft-7" | "draft-2020-12";
   unrepresentable: "throw" | "any";
   override: (ctx: { zodSchema: schemas.$ZodType; jsonSchema: JSONSchema.BaseSchema }) => void;
-  pipes: "input" | "output";
+  io: "input" | "output";
 
   counter = 0;
   seen: Map<schemas.$ZodType, Seen>;
@@ -84,7 +85,7 @@ export class JSONSchemaGenerator {
     this.target = params?.target ?? "draft-2020-12";
     this.unrepresentable = params?.unrepresentable ?? "throw";
     this.override = params?.override ?? (() => {});
-    this.pipes = params?.pipes ?? "output";
+    this.io = params?.io ?? "output";
 
     this.seen = new Map();
   }
@@ -389,14 +390,31 @@ export class JSONSchemaGenerator {
       }
       case "literal": {
         const json: JSONSchema.BaseSchema = _json as any;
+        const vals: (string | number | boolean | null)[] = [];
         for (const val of def.values) {
-          if (val === undefined) throw new Error("Literal `undefined` cannot be represented in JSON Schema");
-          if (typeof val === "bigint") throw new Error("BigInt literals cannot be represented in JSON Schema");
+          if (val === undefined) {
+            if (this.unrepresentable === "throw") {
+              throw new Error("Literal `undefined` cannot be represented in JSON Schema");
+            } else {
+              // do not add to vals
+            }
+          } else if (typeof val === "bigint") {
+            if (this.unrepresentable === "throw") {
+              throw new Error("BigInt literals cannot be represented in JSON Schema");
+            } else {
+              vals.push(Number(val));
+            }
+          } else {
+            vals.push(val);
+          }
         }
-        if (def.values.length === 1) {
-          json.const = def.values[0] as any;
+        if (vals.length === 0) {
+          // do nothing (an undefined literal was stripped)
+        } else if (vals.length === 1) {
+          const val = vals[0];
+          json.const = val;
         } else {
-          json.enum = def.values as any;
+          json.enum = vals;
         }
         break;
       }
@@ -454,7 +472,7 @@ export class JSONSchemaGenerator {
         break;
       }
       case "pipe": {
-        const innerType = this.pipes === "input" ? def.in : def.out;
+        const innerType = this.io === "input" ? def.in : def.out;
         const inner = this.process(innerType, params);
         result.schema = inner;
 
@@ -463,6 +481,7 @@ export class JSONSchemaGenerator {
       case "readonly": {
         const inner = this.process(def.innerType, params);
         Object.assign(_json, inner);
+        // _json.allOf = [inner];
         _json.readOnly = true;
         break;
       }
@@ -538,6 +557,7 @@ export class JSONSchemaGenerator {
         return { ref: "#" };
       }
 
+      // external is configured
       const defsSegment = this.target === "draft-2020-12" ? "$defs" : "definitions";
       if (params.external) {
         const externalId = params.external.registry.get(entry[0])?.id; // ?? "__shared";// `__schema${this.counter++}`;
@@ -547,6 +567,7 @@ export class JSONSchemaGenerator {
         return { defId: id, ref: `${params.external.uri("__shared")}#/${defsSegment}/${id}` };
       }
 
+      // self-contained schema
       const uriPrefix = `#`;
       const defUriPrefix = `${uriPrefix}/${defsSegment}/`;
       const defId = entry[1].schema.id ?? `__schema${this.counter++}`;
@@ -577,6 +598,18 @@ export class JSONSchemaGenerator {
           });
           continue;
         }
+      }
+
+      // handle schemas with `id`
+      const id = this.metadataRegistry.get(entry[0])?.id;
+      if (id) {
+        const { ref, defId } = makeURI(entry);
+        if (defId) defs[defId] = { ...seen.cached };
+        schemaToRef({
+          schema: seen.schema,
+          ref,
+        });
+        continue;
       }
 
       // handle cycles
